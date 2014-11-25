@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,11 +34,12 @@ func main() {
 	numResults := flag.Int("n", 4, "number of results")
 	flag.Parse()
 
-	// Get thumbnail URLs
-	thumbs := GetThumbnails(*search, *numResults)
+	// Create a URL channel
+	cUrl := make(chan string)
+	go GetThumbnails(*search, *numResults, cUrl)
 
 	// Download the images
-	DownloadImages(*search, &thumbs)
+	DownloadImages(*search, *numResults, cUrl)
 	
 	// Finish
 	log.Println("Done")
@@ -58,10 +60,8 @@ func GetURLBase(search string) string {
 
 // GetThumbnails
 // Query the Google Image API for numResults for the search
-func GetThumbnails(search string, numResults int) []string {
+func GetThumbnails(search string, numResults int, cUrl chan string) {
 
-	var resp *http.Response
-	var err error
 	var url string
 
 	// Get the urlBase
@@ -70,43 +70,52 @@ func GetThumbnails(search string, numResults int) []string {
 	// Google API only returns 4 results per query
 	var numIter int = int(math.Ceil(float64(numResults)/ 4))
 
-	// Create thumbnail arrays
-	thumbs := make([]string, numIter * 4)
-	var tmp imageData
+	// Create work groups
+	var wg sync.WaitGroup
+	wg.Add(numIter)
 
 	log.Printf("Searching Google Images for '%s'\n", search)
+	
 	for i := 0; i < numIter; i++ {
 
 		url = urlBase + strconv.Itoa(i)
 
-		// GET images
-		resp, err = http.Get(url)
-		if err != nil {
-			log.Fatal("http.Get: ", err)
-		}
-		defer resp.Body.Close()
+		// Goroutine for each request
+		go func (url string) {
+			// Defer close for the WaitGroup
+			defer wg.Done()
 
-		// Decode to tmp
-		if err = json.NewDecoder(resp.Body).Decode(&tmp); err != nil {
-			log.Fatal("Decoder.Decode: ", err)
-		}
+			// tmp var for unmarshalled JSON
+			var tmp imageData
 
-		// fill thumbs with tmp
-		for j := 0; j < 4; j++ {
-			thumbs[j + (i * 4)] = tmp.ResponseData.Results[j].Url
-		}
+			// GET images
+			resp, err := http.Get(url)
+			if err != nil {
+				log.Fatal("http.Get: ", err)
+			}
+			defer resp.Body.Close()
+
+			// Decode to tmp
+			if err = json.NewDecoder(resp.Body).Decode(&tmp); err != nil {
+				log.Fatal("Decoder.Decode: ", err)
+			}
+
+			// pass URLs onto the channel
+			for _, result := range tmp.ResponseData.Results {
+				cUrl <- result.Url
+			} 
+		} (url)
 	}
 
-	return thumbs[0:numResults]
+	wg.Wait() // wait until the url checks complete
+	close(cUrl)
 }
 
 // DownloadImages
 // Download all of the image URLs in thumbs to a new directory
-func DownloadImages(search string, thumbs *[]string) {
+func DownloadImages(search string, numResults int, cUrl chan string) {
 
-	var resp *http.Response
-	var err error
-	var data []byte
+	var i int = 0
 
 	// Time layout formatter
 	const layout = "_Jan2_06_3:04"
@@ -116,30 +125,43 @@ func DownloadImages(search string, thumbs *[]string) {
 	dir := filenameBase + time.Now().Local().Format(layout)
 
 	// Make the directory for the images
-	if err = os.Mkdir(dir, 0755); err != nil {
+	if err := os.Mkdir(dir, 0755); err != nil {
 		log.Fatal("os.Mkdir: ", err)
 	}
 
 	// Download each URL
 	log.Printf("Downloading thumbnails to '%s'\n", dir)
 
-	for i, url := range *thumbs {
+	// Create work groups
+	var wg sync.WaitGroup
+	wg.Add(numResults)
 
-		// GET images
-		resp, err = http.Get(url)
-		if err != nil {
-			log.Fatal("http.Get: ", err)
-		}
-		defer resp.Body.Close()
+	for url := range cUrl {
 
-    	// We read all the bytes of the image
-    	// Types: data []byte
-	    data, err = ioutil.ReadAll(resp.Body)
-	    if err != nil {
-	        log.Fatal("ioutil.ReadAll: ", err)
-	    }
+		go func (url string, i int) {
+			// Defer close for the WaitGroup
+			defer wg.Done()
 
-	    // Write file to the directory
-	    ioutil.WriteFile(filepath.Join(dir, filenameBase + strconv.Itoa(i) + `.jpg`), data, 0755)
+			// GET images
+			resp, err := http.Get(url)
+			if err != nil {
+				log.Fatal("http.Get: ", err)
+			}
+			defer resp.Body.Close()
+
+	    	// Read the image response
+		    data, err := ioutil.ReadAll(resp.Body)
+		    if err != nil {
+		        log.Fatal("ioutil.ReadAll: ", err)
+		    }
+
+		    // Write file to the directory
+	    	ioutil.WriteFile(filepath.Join(dir, filenameBase + strconv.Itoa(i) + `.jpg`), data, 0755)
+		} (url, i)
+
+		// increment i
+		i++
 	}
+
+	wg.Wait() // wait until the url checks complete
 }
